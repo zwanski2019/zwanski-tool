@@ -1439,7 +1439,6 @@ if start_btn:
         st.error("URL must start with http:// or https://")
     else:
         # Configure proxy globally before any request fires
-        import zwanski_scanner as _self_module  # noqa: F401
         globals()["PROXY_URL"] = proxy_url.strip() if enable_proxy and proxy_url else None
 
         try:

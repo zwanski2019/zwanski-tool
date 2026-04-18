@@ -68,6 +68,10 @@ except Exception:
     pass
 
 
+# Global proxy config — mutated from sidebar at runtime
+PROXY_URL: Optional[str] = None
+
+
 def http_request(
     url: str,
     method: str = "GET",
@@ -79,19 +83,33 @@ def http_request(
     try:
         headers = {"User-Agent": DEFAULT_UA}
         if extra_headers:
-            # urllib rejects headers with \r or \n; sanitize values
             for k, v in extra_headers.items():
                 if isinstance(v, str):
                     v = v.replace("\r", "").replace("\n", "")
                 headers[k] = v
         req = urllib.request.Request(url, headers=headers, method=method)
+
+        # Build opener with optional proxy + redirect control
+        build_args = []
+        if PROXY_URL:
+            proxy_handler = urllib.request.ProxyHandler({
+                "http": PROXY_URL,
+                "https": PROXY_URL,
+            })
+            build_args.append(proxy_handler)
+            # Accept Burp's self-signed cert
+            import ssl
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            build_args.append(urllib.request.HTTPSHandler(context=ctx))
         if not allow_redirects:
             class _NoRedirect(urllib.request.HTTPRedirectHandler):
                 def redirect_request(self, *a, **kw):
                     return None
-            opener = urllib.request.build_opener(_NoRedirect)
-        else:
-            opener = urllib.request.build_opener()
+            build_args.append(_NoRedirect)
+
+        opener = urllib.request.build_opener(*build_args)
         with opener.open(req, timeout=timeout) as r:
             text = r.read().decode("utf-8", errors="replace")
             return Response(r.status, text, dict(r.headers), r.url)
@@ -106,8 +124,6 @@ def http_request(
             hdrs = {}
         return Response(e.code, text, hdrs, url)
     except BaseException:
-        # Catch EVERYTHING — urllib can raise ValueError, UnicodeError,
-        # ssl errors, socket errors, etc. Do not let worker threads die.
         return None
 
 
@@ -195,6 +211,207 @@ class RobotsParser:
             except ET.ParseError:
                 continue
         self.sitemap_urls = sorted(set(self.sitemap_urls))[:200]
+
+
+# ─── Wayback Machine Recon ────────────────────────────────────────────────────
+class WaybackRecon:
+    """
+    Pulls archived URLs from web.archive.org's CDX API.
+    Often finds paths that:
+      - Were once public but are now 403/404
+      - Are in legacy code paths still reachable
+      - Leak old API versions, staging subdomains, internal tools
+    """
+
+    CDX_API = "https://web.archive.org/cdx/search/cdx"
+
+    def __init__(self, base_url: str, timeout: int = 15):
+        parsed = urlparse(base_url)
+        self.host = parsed.hostname or ""
+        self.timeout = timeout
+        self.urls: list[str] = []
+        self.unique_paths: list[str] = []
+        self.status_codes: dict[str, int] = {}
+
+    def fetch(self, limit: int = 500) -> None:
+        """Query CDX for all snapshots, dedupe by urlkey."""
+        if not self.host:
+            return
+        query = urllib.parse.urlencode({
+            "url": f"{self.host}/*",
+            "output": "json",
+            "collapse": "urlkey",
+            "fl": "original,statuscode",
+            "limit": str(limit),
+            "filter": "statuscode:200",
+        })
+        url = f"{self.CDX_API}?{query}"
+        resp = http_request(url, timeout=self.timeout)
+        if not resp or resp.status_code != 200:
+            return
+        try:
+            data = json.loads(resp.text)
+        except Exception:
+            return
+        if not isinstance(data, list) or len(data) < 2:
+            return
+        # First row is headers
+        for row in data[1:]:
+            if len(row) >= 1 and isinstance(row[0], str):
+                self.urls.append(row[0])
+                if len(row) >= 2:
+                    try:
+                        self.status_codes[row[0]] = int(row[1])
+                    except (ValueError, TypeError):
+                        pass
+        # Extract unique paths
+        seen = set()
+        for u in self.urls:
+            try:
+                p = urlparse(u).path
+                if p and p not in seen and p != "/":
+                    seen.add(p)
+                    self.unique_paths.append(p)
+            except Exception:
+                continue
+        self.unique_paths = self.unique_paths[:200]
+
+
+# ─── WAF Fingerprinting ───────────────────────────────────────────────────────
+class WAFDetector:
+    """
+    Detects common WAFs / reverse proxies from response headers + body signatures.
+    Maps each WAF to the bypass categories that are most likely to succeed.
+    """
+
+    SIGNATURES = {
+        "Cloudflare": {
+            "headers": ["cf-ray", "cf-cache-status", "server:cloudflare"],
+            "body": ["cloudflare", "__cf_", "ray id"],
+            "effective_bypasses": [
+                "Origin IP discovery (bypass Cloudflare entirely)",
+                "X-Forwarded-For is stripped — useless",
+                "cf-connecting-ip spoofing works in some misconfigs",
+                "Path mutation (Cloudflare caches aggressively, try cache busting)",
+            ],
+        },
+        "Akamai": {
+            "headers": ["x-akamai-", "akamai-", "server:akamaighost"],
+            "body": ["akamai reference"],
+            "effective_bypasses": [
+                "True-Client-IP header injection",
+                "X-Forwarded-For chaining",
+                "Method override with exotic verbs",
+            ],
+        },
+        "AWS WAF": {
+            "headers": ["x-amzn-requestid", "x-amzn-errortype", "x-amz-cf-id"],
+            "body": ["awselb", "request blocked"],
+            "effective_bypasses": [
+                "Path parameter injection (;)",
+                "HTTP method fuzzing",
+                "Body parameter pollution",
+            ],
+        },
+        "Imperva / Incapsula": {
+            "headers": ["x-iinfo", "x-cdn:incapsula", "visid_incap"],
+            "body": ["incapsula incident"],
+            "effective_bypasses": [
+                "Unicode normalization",
+                "Encoded path traversal",
+                "User-Agent spoofing (Googlebot)",
+            ],
+        },
+        "Sucuri": {
+            "headers": ["x-sucuri-id", "x-sucuri-cache", "server:sucuri"],
+            "body": ["access denied - sucuri"],
+            "effective_bypasses": [
+                "Origin IP discovery",
+                "X-Forwarded-For whitelisting bypass",
+            ],
+        },
+        "F5 BIG-IP ASM": {
+            "headers": ["bigipserver", "f5-"],
+            "body": ["the requested url was rejected"],
+            "effective_bypasses": [
+                "Path parameter injection",
+                "HTTP Pragma / Cache-Control tricks",
+            ],
+        },
+        "ModSecurity / OWASP CRS": {
+            "headers": ["mod_security", "server:mod_security"],
+            "body": ["mod_security", "reference #"],
+            "effective_bypasses": [
+                "Multipart / charset confusion",
+                "HTTP parameter pollution",
+                "Double URL encoding",
+            ],
+        },
+        "Barracuda": {
+            "headers": ["barra_counter_session", "barracuda_"],
+            "body": ["you have been blocked"],
+            "effective_bypasses": [
+                "Header injection (X-Forwarded-For)",
+                "Method override",
+            ],
+        },
+        "Nginx": {
+            "headers": ["server:nginx"],
+            "body": [],
+            "effective_bypasses": [
+                "Off-by-slash (CVE-2021-23017 style)",
+                "Alias traversal",
+                "Merge slashes confusion",
+            ],
+        },
+        "Apache": {
+            "headers": ["server:apache"],
+            "body": [],
+            "effective_bypasses": [
+                "Trailing dot / space",
+                ".htaccess regex mismatches",
+                "mod_rewrite confusion",
+            ],
+        },
+        "IIS": {
+            "headers": ["server:microsoft-iis", "x-powered-by:asp.net"],
+            "body": [],
+            "effective_bypasses": [
+                "Case insensitivity exploitation",
+                "Trailing ::$DATA stream",
+                "~1 short filename enumeration",
+            ],
+        },
+    }
+
+    @classmethod
+    def detect(cls, resp: Response) -> dict:
+        """Returns {detected: [waf_names], strategies: [...]}"""
+        if not resp:
+            return {"detected": [], "strategies": [], "confidence": 0}
+        detected = []
+        strategies = []
+        haystack_headers = " ".join(f"{k}:{v}".lower() for k, v in resp.headers.items())
+        haystack_body = resp.text[:5000].lower()
+        for name, sig in cls.SIGNATURES.items():
+            for h in sig["headers"]:
+                if h.lower() in haystack_headers:
+                    if name not in detected:
+                        detected.append(name)
+                        strategies.extend(sig["effective_bypasses"])
+                    break
+            for b in sig["body"]:
+                if b.lower() in haystack_body:
+                    if name not in detected:
+                        detected.append(name)
+                        strategies.extend(sig["effective_bypasses"])
+                    break
+        confidence = min(100, len(detected) * 40 + (20 if haystack_headers else 0))
+        return {
+            "detected": detected,
+            "strategies": strategies,
+            "confidence": confidence,
+        }
 
 
 # ─── Real Bypass Techniques ───────────────────────────────────────────────────
@@ -650,6 +867,62 @@ class SecurityScanner:
         self.workers = workers
         self.robots = RobotsParser(base_url, timeout=timeout)
         self.bypass = BypassEngine()
+        # WAF fingerprinting runs once on the homepage
+        self.waf = self._fingerprint_waf()
+
+    def _fingerprint_waf(self) -> dict:
+        """Hit the root URL once and fingerprint any WAF in front of it."""
+        try:
+            resp = http_request(self.base_url + "/", timeout=self.timeout)
+            if not resp:
+                return {"detected": [], "strategies": [], "confidence": 0}
+            return WAFDetector.detect(resp)
+        except Exception:
+            return {"detected": [], "strategies": [], "confidence": 0}
+
+    def scan_wayback(self, progress_cb=None) -> dict:
+        """Fetch archived URLs from Wayback Machine, probe unique paths for liveness."""
+        recon = WaybackRecon(self.base_url, timeout=self.timeout)
+        recon.fetch(limit=500)
+
+        result = {
+            "host": recon.host,
+            "total_archived_urls": len(recon.urls),
+            "unique_paths": recon.unique_paths,
+            "live_findings": [],
+        }
+
+        if not recon.unique_paths:
+            return result
+
+        def probe(path):
+            url = f"{self.base_url}{path if path.startswith('/') else '/' + path}"
+            resp = http_request(url, timeout=self.timeout)
+            if not resp:
+                return None
+            if resp.status_code in (200, 301, 302, 401, 403):
+                return {
+                    "path": path,
+                    "url": url,
+                    "status": resp.status_code,
+                    "size": len(resp.content),
+                    "was_archived_200": recon.status_codes.get(url) == 200,
+                }
+            return None
+
+        total = len(recon.unique_paths)
+        with ThreadPoolExecutor(max_workers=self.workers) as pool:
+            futures = {pool.submit(probe, p): p for p in recon.unique_paths}
+            for i, fut in enumerate(as_completed(futures)):
+                try:
+                    r = fut.result()
+                except BaseException:
+                    r = None
+                if r:
+                    result["live_findings"].append(r)
+                if progress_cb:
+                    progress_cb((i + 1) / total)
+        return result
 
     # ── helpers ────────────────────────────────────────────────────────────
     def _analyze_response(self, resp: Response) -> list[str]:
@@ -1040,6 +1313,8 @@ _DEFAULTS = {
     "hidden_files": [],
     "injections": [],
     "endpoints": [],
+    "wayback_results": {},
+    "waf_info": {},
     "force_bypass_results": {},
     "ai_triage": "",
     "ai_reports": {},
@@ -1067,6 +1342,8 @@ with st.sidebar:
     enable_hidden_files = st.checkbox("Hidden Files", value=True)
     enable_injection = st.checkbox("Parameter Injection", value=False)
     enable_endpoints = st.checkbox("Sitemap/Endpoint Probe", value=True)
+    enable_wayback = st.checkbox("Wayback Machine Recon", value=False,
+                                 help="Pull archived URLs from web.archive.org")
 
     st.divider()
     st.markdown("### 🔓 Force Bypass (Single URL)")
@@ -1076,6 +1353,16 @@ with st.sidebar:
         placeholder="https://target.com/admin",
         disabled=not enable_force_bypass,
         help="Fires 100+ bypass techniques at this exact URL",
+    )
+
+    st.divider()
+    st.markdown("### 🔌 Proxy (Burp / ZAP)")
+    enable_proxy = st.checkbox("Route traffic through HTTP proxy", value=False)
+    proxy_url = st.text_input(
+        "Proxy URL",
+        value="http://127.0.0.1:8080",
+        disabled=not enable_proxy,
+        help="For live interception in Burp Suite or OWASP ZAP during demos",
     )
 
     st.divider()
@@ -1151,6 +1438,10 @@ if start_btn:
     elif not target_url.startswith(("http://", "https://")):
         st.error("URL must start with http:// or https://")
     else:
+        # Configure proxy globally before any request fires
+        import zwanski_scanner as _self_module  # noqa: F401
+        globals()["PROXY_URL"] = proxy_url.strip() if enable_proxy and proxy_url else None
+
         try:
             scanner = SecurityScanner(
                 target_url,
@@ -1162,11 +1453,25 @@ if start_btn:
             st.error(f"Failed to init scanner: {e}")
             st.stop()
 
+        # Show WAF fingerprint upfront
+        waf = scanner.waf
+        st.session_state["waf_info"] = waf
+        if waf["detected"]:
+            st.warning(
+                f"🛡️ **WAF detected:** {', '.join(waf['detected'])} "
+                f"(confidence: {waf['confidence']}%)"
+            )
+            with st.expander("Recommended bypass strategies for this WAF"):
+                for s in waf["strategies"]:
+                    st.markdown(f"- {s}")
+        else:
+            st.info("No obvious WAF signature on root — proceeding with standard bypass matrix")
+
         prog = st.progress(0.0)
         msg = st.empty()
 
         modules = [enable_robots_bypass, enable_hidden_files, enable_injection,
-                   enable_endpoints, enable_force_bypass]
+                   enable_endpoints, enable_wayback, enable_force_bypass]
         total_modules = max(sum(modules), 1)
         base = 0.0
 
@@ -1195,6 +1500,13 @@ if start_btn:
         if enable_endpoints:
             msg.info("🔗 Probing sitemap + robots URLs…")
             st.session_state["endpoints"] = scanner.scan_endpoints(
+                lambda p: prog.progress(min(base + p / total_modules, 1.0))
+            )
+            base += 1 / total_modules
+
+        if enable_wayback:
+            msg.info("🕰️ Querying Wayback Machine for archived URLs…")
+            st.session_state["wayback_results"] = scanner.scan_wayback(
                 lambda p: prog.progress(min(base + p / total_modules, 1.0))
             )
             base += 1 / total_modules
@@ -1243,6 +1555,33 @@ if st.session_state["scan_done"]:
                 f'<div class="label">{label}</div></div>',
                 unsafe_allow_html=True,
             )
+
+    # WAF + proxy banner
+    waf_info = st.session_state.get("waf_info", {})
+    banner_cols = st.columns(2)
+    with banner_cols[0]:
+        if waf_info.get("detected"):
+            st.markdown(
+                f'<div style="background:#ffa72611;border-left:3px solid #ffa726;padding:10px;border-radius:6px;">'
+                f'🛡️ <strong>WAF:</strong> {", ".join(waf_info["detected"])} '
+                f'<span style="color:#8b949e">(confidence {waf_info["confidence"]}%)</span>'
+                f'</div>', unsafe_allow_html=True)
+        else:
+            st.markdown(
+                '<div style="background:#00c85311;border-left:3px solid #00c853;padding:10px;border-radius:6px;">'
+                '🛡️ <strong>WAF:</strong> none detected on root</div>',
+                unsafe_allow_html=True)
+    with banner_cols[1]:
+        if globals().get("PROXY_URL"):
+            st.markdown(
+                f'<div style="background:#2979ff11;border-left:3px solid #2979ff;padding:10px;border-radius:6px;">'
+                f'🔌 <strong>Proxy:</strong> <code>{globals()["PROXY_URL"]}</code></div>',
+                unsafe_allow_html=True)
+        else:
+            st.markdown(
+                '<div style="background:#11182711;border-left:3px solid #30363d;padding:10px;border-radius:6px;">'
+                '🔌 <strong>Proxy:</strong> direct connection</div>',
+                unsafe_allow_html=True)
     st.divider()
 
     # Tabs
@@ -1251,6 +1590,7 @@ if st.session_state["scan_done"]:
     if enable_hidden_files:  tab_labels.append("📁 Hidden Files")
     if enable_injection:     tab_labels.append("💉 Injections")
     if enable_endpoints:     tab_labels.append("🔗 Endpoints")
+    if enable_wayback:       tab_labels.append("🕰️ Wayback")
     if enable_force_bypass:  tab_labels.append("🔓 Force Bypass")
     if ai_enabled:           tab_labels.append("🧠 AI Analysis")
     tab_labels.append("📄 Report")
@@ -1332,6 +1672,39 @@ if st.session_state["scan_done"]:
                     st.markdown(f'<div class="mono-block">{item["url"]}</div>', unsafe_allow_html=True)
                     for e in item.get("evidence", []):
                         st.markdown(f"- {e}")
+        idx += 1
+
+    # ── Wayback Machine tab ────────────────────────────────────────────────
+    if enable_wayback:
+        with tabs[idx]:
+            st.subheader("🕰️ Wayback Machine Recon")
+            wb = st.session_state.get("wayback_results", {})
+            if not wb:
+                st.info("Enable Wayback module and run scan.")
+            else:
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Archived URLs", wb.get("total_archived_urls", 0))
+                col2.metric("Unique paths", len(wb.get("unique_paths", [])))
+                col3.metric("Still live", len(wb.get("live_findings", [])))
+
+                live = wb.get("live_findings", [])
+                if live:
+                    st.markdown("### Live paths from the archive")
+                    # Sort: 200s first, then 401/403 (interesting), then redirects
+                    priority = {200: 0, 401: 1, 403: 1, 301: 2, 302: 2}
+                    live_sorted = sorted(live, key=lambda x: priority.get(x["status"], 99))
+                    for item in live_sorted[:100]:
+                        archived_badge = "📜" if item.get("was_archived_200") else "  "
+                        with st.expander(f"{archived_badge} [{item['status']}] {item['path']}"):
+                            st.markdown(f'<div class="mono-block">{item["url"]}</div>',
+                                        unsafe_allow_html=True)
+                            st.markdown(f"**Size:** {item['size']} bytes")
+                            if item["status"] in (401, 403):
+                                st.info("🎯 Protected now — feed this into Force Bypass")
+
+                if wb.get("unique_paths"):
+                    with st.expander(f"📜 All {len(wb['unique_paths'])} archived paths (raw)"):
+                        st.code("\n".join(wb["unique_paths"]))
         idx += 1
 
     # ── Force Bypass tab ───────────────────────────────────────────────────
@@ -1553,6 +1926,8 @@ if st.session_state["scan_done"]:
             "hidden_files": hf,
             "injections": inj,
             "endpoints": ep,
+            "wayback": st.session_state.get("wayback_results", {}),
+            "waf_fingerprint": st.session_state.get("waf_info", {}),
             "force_bypass": st.session_state.get("force_bypass_results", {}),
             "ai": {
                 "enabled": ai_enabled,
